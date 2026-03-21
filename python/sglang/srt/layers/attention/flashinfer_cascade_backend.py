@@ -27,8 +27,8 @@ class CascadeDraftAttnBackend(AttentionBackend):
 
     Each instance handles one draft decode step. All instances share a single
     CascadeBatchAttentionWrapper from the parent CascadeMultiStepDraftBackend.
-    The parent plans each step sequentially (plan once, then fast_cascade_plan
-    for subsequent steps within the same round).
+    Before each step's forward, update_draft_step() patches the shared
+    workspace buffer with this step's kv_len/kv_end.
     """
 
     def __init__(
@@ -51,6 +51,10 @@ class CascadeDraftAttnBackend(AttentionBackend):
 
         self.cascade_attn = cascade_attn  # shared reference
         self._step_index = step_index
+
+        # Set by parent before forward
+        self._step_kv_len = None
+        self._step_kv_end = None
         self._plan_ready = False
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -76,6 +80,9 @@ class CascadeDraftAttnBackend(AttentionBackend):
                 layer, cache_loc, k, v, layer.k_scale, layer.v_scale
             )
 
+        # Patch the shared workspace for this step's kv_len/kv_end
+        self.cascade_attn.update_draft_step(self._step_kv_len, self._step_kv_end)
+
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
@@ -95,10 +102,10 @@ class CascadeMultiStepDraftBackend:
       Level 1: shared prefix (read once across all topk branches)
       Level 2: unique suffix (draft tokens per branch)
 
-    Plans each step using the shared wrapper. First step uses plan() (JIT
-    compile), subsequent steps use fast_cascade_plan() (no sync). All steps
-    within a round share the same level-1 indices since the prefix doesn't
-    change during draft decode.
+    Plans once per speculative round for the max draft step, then patches
+    kv_len/kv_end per step via update_draft_step(). With page_size=1, the
+    kernel reads up to kv_end tokens from pre-allocated kv_indices — extra
+    entries for later steps are simply not accessed.
 
     NOTE: page_size=1 is always used for FlashInfer cascade plan calls because
     SGLang's req_to_token stores per-token physical slot IDs (not page IDs).
@@ -134,11 +141,12 @@ class CascadeMultiStepDraftBackend:
         self._modules_initialized = False
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Plan cascade attention for each draft step.
+        """Plan cascade attention once for the max draft step.
 
-        Uses plan() on first call (JIT compile), then fast_cascade_plan()
-        for all subsequent calls (no GPU sync). Level-1 indices are shared
-        across steps; level-2 indices are rebuilt per step.
+        Builds kv_indices for the max step (all draft tokens pre-loaded in
+        kv_indices). Plans once via plan_for_draft(), which extracts workspace
+        offsets so update_draft_step() can patch kv_len/kv_end per step without
+        re-running the C++ scheduler.
         """
         num_seqs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
@@ -166,34 +174,44 @@ class CascadeMultiStepDraftBackend:
             0, total_branches + 1, dtype=torch.int32, device="cpu",
         )
 
-        # Build unique suffix indices for all steps
-        all_kv_indices_unique = []
-        all_kv_indptr_unique = []
-        all_kv_len_unique = []
-        for i in range(self.speculative_num_steps - 1):
-            step_offset = i + 1
-            kv_indptr_unique, kv_indices_unique, kv_len_unique = build_unique_indices(
-                req_pool_indices, req_to_token, seq_lens, self.topk,
-                step_offset, self.speculative_num_steps, self.page_size,
-                self.device, self.pool_len,
-            )
-            all_kv_indices_unique.append(kv_indices_unique)
-            all_kv_indptr_unique.append(kv_indptr_unique)
-            all_kv_len_unique.append(kv_len_unique)
+        # Build unique suffix indices for MAX step only.
+        # With page_size=1, kv_indices has max_step_offset entries per branch.
+        # For earlier steps, the kernel only reads up to kv_end tokens —
+        # extra entries are present but never accessed.
+        max_step_offset = self.speculative_num_steps - 1
+        kv_indptr_unique, kv_indices_unique, kv_len_unique = build_unique_indices(
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            self.topk,
+            max_step_offset,
+            self.speculative_num_steps,
+            self.page_size,
+            self.device,
+            self.pool_len,
+        )
 
         # Batch GPU->CPU transfer: one sync
         kv_indptr_shared_cpu = kv_indptr_shared.to("cpu", non_blocking=True)
         kv_len_shared_cpu = kv_len_shared.to("cpu", non_blocking=True)
-        all_kv_indptr_unique_cpu = [t.to("cpu", non_blocking=True) for t in all_kv_indptr_unique]
-        all_kv_len_unique_cpu = [t.to("cpu", non_blocking=True) for t in all_kv_len_unique]
+        kv_indptr_unique_cpu = kv_indptr_unique.to("cpu", non_blocking=True)
+        kv_len_unique_cpu = kv_len_unique.to("cpu", non_blocking=True)
         torch.cuda.synchronize()
 
         # Slice kv_indices_shared to actual size
         actual_total_prefix = int(kv_indptr_shared_cpu[-1].item())
         kv_indices_shared = kv_indices_shared[:actual_total_prefix]
 
+        # Plan once for the max step
         backend = self.attn_backends[0]  # all share same config
-        common = dict(
+        first_call = not self._modules_initialized
+        self.shared_cascade_attn.plan_for_draft(
+            max_draft_depth=max_step_offset,
+            first_call=first_call,
+            qo_indptr_host_arr=[qo_indptr_shared_cpu, qo_indptr_unique_cpu],
+            kv_indptr_host_arr=[kv_indptr_shared_cpu, kv_indptr_unique_cpu],
+            kv_indices_arr=[kv_indices_shared, kv_indices_unique],
+            kv_len_host_arr=[kv_len_shared_cpu, kv_len_unique_cpu],
             num_qo_heads=backend.num_qo_heads,
             num_kv_heads=backend.num_kv_heads,
             head_dim_qk=backend.head_dim,
@@ -204,27 +222,15 @@ class CascadeMultiStepDraftBackend:
             q_data_type=backend.q_data_type,
             kv_data_type=backend.data_type,
         )
+        self._modules_initialized = True
 
+        # Set per-step kv_len/kv_end for update_draft_step().
+        # Non-causal level 2: kv_len_for_work = kv_len_level + qo_len = step_offset + 1
+        # kv_end = effective_kv_len = step_offset
         for i in range(self.speculative_num_steps - 1):
-            if not self._modules_initialized:
-                # First call: plan() to JIT-compile the module
-                self.shared_cascade_attn.plan(
-                    qo_indptr_arr=[qo_indptr_shared_cpu, qo_indptr_unique_cpu],
-                    kv_indptr_arr=[kv_indptr_shared_cpu, all_kv_indptr_unique_cpu[i]],
-                    kv_indices_arr=[kv_indices_shared, all_kv_indices_unique[i]],
-                    kv_len_arr=[kv_len_shared_cpu, all_kv_len_unique_cpu[i]],
-                    **common,
-                )
-                self._modules_initialized = True
-            else:
-                # Subsequent calls: fast_cascade_plan (no GPU sync)
-                self.shared_cascade_attn.fast_cascade_plan(
-                    qo_indptr_host_arr=[qo_indptr_shared_cpu, qo_indptr_unique_cpu],
-                    kv_indptr_host_arr=[kv_indptr_shared_cpu, all_kv_indptr_unique_cpu[i]],
-                    kv_indices_arr=[kv_indices_shared, all_kv_indices_unique[i]],
-                    kv_len_host_arr=[kv_len_shared_cpu, all_kv_len_unique_cpu[i]],
-                    **common,
-                )
+            step_offset = i + 1
+            self.attn_backends[i]._step_kv_len = step_offset + 1
+            self.attn_backends[i]._step_kv_end = step_offset
             self.attn_backends[i]._plan_ready = True
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -251,6 +257,8 @@ class CascadeMultiStepDraftBackend:
             new.q_data_type = old.q_data_type
             new.max_context_len = old.max_context_len
             new._step_index = i
+            new._step_kv_len = None
+            new._step_kv_end = None
             new._plan_ready = False
             new.cascade_attn = CascadeBatchAttention(
                 num_levels=2,
@@ -345,4 +353,6 @@ class CascadeMultiStepDraftBackend:
                     kv_len_arr=[kv_len_shared_cpu, all_kv_len_unique_cpu[i]],
                     **plan_kwargs,
                 )
+            backend._step_kv_len = (i + 1) + 1
+            backend._step_kv_end = i + 1
             backend._plan_ready = True
