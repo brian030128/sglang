@@ -147,39 +147,60 @@ class CascadeMultiStepDraftBackend:
         kv_indices). Plans once via plan_for_draft(), which extracts workspace
         offsets so update_draft_step() can patch kv_len/kv_end per step without
         re-running the C++ scheduler.
+
+        CPU tensors (kv_indptr, kv_len) are computed directly from
+        forward_batch.seq_lens_cpu to avoid GPU->CPU sync.
         """
         num_seqs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         seq_lens = forward_batch.seq_lens
 
-        # Level 1: shared prefix — generated once, reused across steps
-        max_total_prefix = num_seqs * self.max_context_len
-        kv_indptr_shared, kv_indices_shared, kv_len_shared = build_shared_indices(
+        # Use CPU seq_lens to build CPU tensors without GPU->CPU sync
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.to("cpu")
+            torch.cuda.synchronize()
+
+        # Level 1 CPU tensors: computed directly on CPU (no GPU transfer)
+        kv_len_shared_cpu = seq_lens_cpu.to(torch.int32)
+        kv_indptr_shared_cpu = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cpu")
+        torch.cumsum(kv_len_shared_cpu, dim=0, out=kv_indptr_shared_cpu[1:])
+        actual_total_prefix = int(kv_indptr_shared_cpu[-1].item())
+
+        # Level 1 GPU tensors: kv_indices from Triton kernel (stays on GPU)
+        kv_indices_shared = torch.empty(actual_total_prefix, dtype=torch.int32, device=self.device)
+        kv_indptr_shared_gpu = torch.empty(num_seqs + 1, dtype=torch.int32, device=self.device)
+
+        BLOCK_SIZE = 128
+        from sglang.srt.speculative.cascade_index_gen import (
+            generate_cascade_shared_kv_indices,
+            next_power_of_2,
+        )
+        generate_cascade_shared_kv_indices[(num_seqs,)](
             req_pool_indices,
             req_to_token,
             seq_lens,
-            self.device,
+            kv_indices_shared,
+            kv_indptr_shared_gpu,
             self.pool_len,
-            max_total_prefix=max_total_prefix,
+            next_power_of_2(num_seqs),
+            BLOCK_SIZE,
         )
 
-        # qo_indptr: deterministic arange tensors, build directly on CPU
-        qo_indptr_shared_cpu = torch.arange(
-            0, (num_seqs + 1) * self.topk, self.topk,
-            dtype=torch.int32, device="cpu",
-        )
-        total_branches = num_seqs * self.topk
-        qo_indptr_unique_cpu = torch.arange(
-            0, total_branches + 1, dtype=torch.int32, device="cpu",
-        )
-
-        # Build unique suffix indices for MAX step only.
-        # With page_size=1, kv_indices has max_step_offset entries per branch.
-        # For earlier steps, the kernel only reads up to kv_end tokens —
-        # extra entries are present but never accessed.
+        # Level 2 CPU tensors: deterministic, computed on CPU
         max_step_offset = self.speculative_num_steps - 1
-        kv_indptr_unique, kv_indices_unique, kv_len_unique = build_unique_indices(
+        total_branches = num_seqs * self.topk
+        kv_len_unique_cpu = torch.full(
+            (total_branches,), max_step_offset, dtype=torch.int32, device="cpu"
+        )
+        kv_indptr_unique_cpu = torch.arange(
+            0, (total_branches + 1) * max_step_offset, max_step_offset,
+            dtype=torch.int32, device="cpu",
+        )[:total_branches + 1]
+
+        # Level 2 GPU tensors: kv_indices from Triton kernel
+        kv_indptr_unique, kv_indices_unique, _ = build_unique_indices(
             req_pool_indices,
             req_to_token,
             seq_lens,
@@ -191,16 +212,17 @@ class CascadeMultiStepDraftBackend:
             self.pool_len,
         )
 
-        # Batch GPU->CPU transfer: one sync
-        kv_indptr_shared_cpu = kv_indptr_shared.to("cpu", non_blocking=True)
-        kv_len_shared_cpu = kv_len_shared.to("cpu", non_blocking=True)
-        kv_indptr_unique_cpu = kv_indptr_unique.to("cpu", non_blocking=True)
-        kv_len_unique_cpu = kv_len_unique.to("cpu", non_blocking=True)
-        torch.cuda.synchronize()
+        # qo_indptr: deterministic, built on CPU
+        qo_indptr_shared_cpu = torch.arange(
+            0, (num_seqs + 1) * self.topk, self.topk,
+            dtype=torch.int32, device="cpu",
+        )
+        qo_indptr_unique_cpu = torch.arange(
+            0, total_branches + 1, dtype=torch.int32, device="cpu",
+        )
 
-        # Slice kv_indices_shared to actual size
-        actual_total_prefix = int(kv_indptr_shared_cpu[-1].item())
-        kv_indices_shared = kv_indices_shared[:actual_total_prefix]
+        # No torch.cuda.synchronize() needed — all CPU tensors computed on CPU.
+        # GPU tensors (kv_indices) are passed directly to the kernel.
 
         # Plan once for the max step
         backend = self.attn_backends[0]  # all share same config
