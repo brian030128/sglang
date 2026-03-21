@@ -1,4 +1,5 @@
 import logging
+import os
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils.common import is_blackwell
@@ -106,6 +107,15 @@ class DraftBackendFactory:
         return NativeSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_flashinfer_decode_backend(self):
+        if os.environ.get("SGLANG_CASCADE_DRAFT") == "1":
+            from sglang.srt.layers.attention.flashinfer_cascade_backend import (
+                CascadeMultiStepDraftBackend,
+            )
+            logger.info("Using cascade draft decode backend (SGLANG_CASCADE_DRAFT=1)")
+            return CascadeMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
         if not get_global_server_args().use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
                 FlashInferMultiStepDraftBackend,
