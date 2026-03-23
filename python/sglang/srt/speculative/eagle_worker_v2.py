@@ -30,7 +30,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
-from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_utils import DraftBackendFactory, nvtx_pop, nvtx_push
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -426,6 +426,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            nvtx_push(f"eagle/draft/step_{i}")
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -435,6 +436,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
+                nvtx_pop()
                 break
 
             # Set inputs
@@ -460,6 +462,7 @@ class EagleDraftWorker(BaseDraftWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            nvtx_pop()
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
@@ -721,21 +724,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
+            nvtx_push("eagle/draft")
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
+            nvtx_pop()
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
+            nvtx_push("eagle/verify")
             batch_output = self.verify(model_worker_batch)
+            nvtx_pop()
+            nvtx_push("eagle/draft_extend_after_decode")
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
+            nvtx_pop()
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
@@ -789,6 +798,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute)
+        nvtx_push("eagle/verify/target_forward")
         forward_batch_output = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
             forward_batch=verify_forward_batch,
@@ -796,6 +806,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             skip_attn_backend_init=True,
         )
         logits_output = forward_batch_output.logits_output
+        nvtx_pop()
 
         # Generate vocab mask for constrained decoding
         vocab_mask = None
@@ -819,11 +830,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        nvtx_push("eagle/verify/acceptance")
         (
             predict,
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
+        nvtx_pop()
         new_seq_lens = batch.seq_lens + accept_length
 
         # Update mamba state for hybrid GDN models after verification

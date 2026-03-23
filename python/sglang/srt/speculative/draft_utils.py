@@ -1,10 +1,24 @@
 import logging
 import os
 
+import torch.cuda.nvtx
+
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils.common import is_blackwell
 
 logger = logging.getLogger(__name__)
+
+_NVTX_DRAFT = os.environ.get("SGLANG_NVTX_DRAFT", "0") == "1"
+
+
+def nvtx_push(name: str):
+    if _NVTX_DRAFT:
+        torch.cuda.nvtx.range_push(name)
+
+
+def nvtx_pop():
+    if _NVTX_DRAFT:
+        torch.cuda.nvtx.range_pop()
 
 
 class DraftBackendFactory:
@@ -107,11 +121,13 @@ class DraftBackendFactory:
         return NativeSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_flashinfer_decode_backend(self):
-        if os.environ.get("SGLANG_CASCADE_DRAFT") == "1":
+        cascade_val = os.environ.get("SGLANG_CASCADE_DRAFT")
+        print(f"[DraftBackendFactory] SGLANG_CASCADE_DRAFT={cascade_val!r} (pid={os.getpid()})", flush=True)
+        if cascade_val == "1":
             from sglang.srt.layers.attention.flashinfer_cascade_backend import (
                 CascadeMultiStepDraftBackend,
             )
-            logger.info("Using cascade draft decode backend (SGLANG_CASCADE_DRAFT=1)")
+            print("[DraftBackendFactory] Creating CascadeMultiStepDraftBackend", flush=True)
             return CascadeMultiStepDraftBackend(
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )

@@ -30,7 +30,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.draft_utils import DraftBackendFactory
+from sglang.srt.speculative.draft_utils import DraftBackendFactory, nvtx_pop, nvtx_push
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -312,14 +312,20 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            nvtx_push("eagle/draft")
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 spec_info = self.draft(batch)
+            nvtx_pop()
+
+            nvtx_push("eagle/verify")
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+            nvtx_pop()
 
+            nvtx_push("eagle/draft_extend_after_decode")
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -331,6 +337,7 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+            nvtx_pop()
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -650,6 +657,7 @@ class EAGLEWorker(TpModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
+            nvtx_push(f"eagle/draft/step_{i}")
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -659,6 +667,7 @@ class EAGLEWorker(TpModelWorker):
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
+                nvtx_pop()
                 break
 
             # Set inputs
@@ -692,6 +701,7 @@ class EAGLEWorker(TpModelWorker):
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
+            nvtx_pop()
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
@@ -728,6 +738,7 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
+        nvtx_push("eagle/verify/target_forward")
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
@@ -735,6 +746,7 @@ class EAGLEWorker(TpModelWorker):
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
+        nvtx_pop()
 
         vocab_mask = None
         if batch.has_grammar:
@@ -759,6 +771,7 @@ class EAGLEWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
+        nvtx_push("eagle/verify/acceptance")
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
@@ -766,6 +779,7 @@ class EAGLEWorker(TpModelWorker):
             self.page_size,
             vocab_mask,
         )
+        nvtx_pop()
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
