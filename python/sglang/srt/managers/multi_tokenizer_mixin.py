@@ -132,6 +132,8 @@ def _handle_output_by_index(output, i):
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
             ),
+            spec_draft_time=_extract_field_by_index(output, "spec_draft_time", i),
+            spec_verify_time=_extract_field_by_index(output, "spec_verify_time", i),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             decoded_texts=_extract_field_by_index(output, "decoded_texts", i),
@@ -219,6 +221,8 @@ def _handle_output_by_index(output, i):
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
             ),
+            spec_draft_time=_extract_field_by_index(output, "spec_draft_time", i),
+            spec_verify_time=_extract_field_by_index(output, "spec_verify_time", i),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),

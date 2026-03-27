@@ -30,7 +30,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.draft_utils import DraftBackendFactory, nvtx_pop, nvtx_push
+from sglang.srt.speculative.draft_utils import DraftBackendFactory, _TIME_SPEC, nvtx_pop, nvtx_push
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -313,16 +313,31 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             nvtx_push("eagle/draft")
+            if _TIME_SPEC:
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 spec_info = self.draft(batch)
+            if _TIME_SPEC:
+                torch.cuda.synchronize()
+                _draft_elapsed = time.perf_counter() - _t0
+                for req in batch.reqs:
+                    req.spec_draft_time += _draft_elapsed
             nvtx_pop()
 
             nvtx_push("eagle/verify")
+            if _TIME_SPEC:
+                _t0 = time.perf_counter()
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+            if _TIME_SPEC:
+                torch.cuda.synchronize()
+                _verify_elapsed = time.perf_counter() - _t0
+                for req in batch.reqs:
+                    req.spec_verify_time += _verify_elapsed
             nvtx_pop()
 
             nvtx_push("eagle/draft_extend_after_decode")

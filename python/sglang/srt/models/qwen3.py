@@ -26,6 +26,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
@@ -216,8 +217,7 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
         self.self_attn = Qwen3Attention(

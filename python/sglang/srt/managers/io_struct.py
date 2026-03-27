@@ -91,6 +91,10 @@ class SpeculativeDecodingMetricsMixin:
     # Empty list [] when speculative decoding is disabled.
     spec_acceptance_histogram: List[List[int]]
 
+    # Wall-clock draft and verify times (seconds), populated when SGLANG_TIME_SPEC=1
+    spec_draft_time: List[float]
+    spec_verify_time: List[float]
+
 
 # Parameters for a session
 @dataclass

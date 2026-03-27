@@ -9,6 +9,7 @@ from sglang.srt.utils.common import is_blackwell
 logger = logging.getLogger(__name__)
 
 _NVTX_DRAFT = os.environ.get("SGLANG_NVTX_DRAFT", "0") == "1"
+_TIME_SPEC = os.environ.get("SGLANG_TIME_SPEC", "0") == "1"
 
 
 def nvtx_push(name: str):
