@@ -103,6 +103,11 @@ class PrefillMetadata:
     multi_item_params: Optional[MultiItemScoringParams] = None
 
 
+@dataclass
+class CascadeVerifyMetadata:
+    cascade_wrappers: list
+
+
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
@@ -288,6 +293,23 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
             )
 
+        # Cascade verify backend (toggled by SGLANG_CASCADE_VERIFY=1)
+        self._cascade_verify = os.environ.get("SGLANG_CASCADE_VERIFY") == "1"
+        print(f"[DEBUG] _cascade_verify = {self._cascade_verify}  (SGLANG_CASCADE_VERIFY={os.environ.get('SGLANG_CASCADE_VERIFY', 'unset')})")
+        self._page_size = model_runner.page_size
+        if self._cascade_verify and not skip_prefill:
+            from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
+
+            self.cascade_verify_wrappers = []
+            for _ in range(self.num_wrappers):
+                self.cascade_verify_wrappers.append(
+                    MultiLevelCascadeAttentionWrapper(
+                        num_levels=2,
+                        float_workspace_buffer=self.workspace_buffer,
+                        kv_layout="NHD",
+                    )
+                )
+
         # Create indices updater
         if not skip_prefill:
             self.indices_updater_prefill = FlashInferIndicesUpdaterPrefill(
@@ -454,20 +476,23 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.prefill_wrappers_paged, False, False
             )
         elif forward_batch.forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_wrappers_verify,
-                use_ragged=False,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
-            )
-            self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_verify, False, False
-            )
+            if self._cascade_verify and self._page_size == 1:
+                self._init_cascade_verify(forward_batch)
+            else:
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens=None,
+                    prefill_wrappers=self.prefill_wrappers_verify,
+                    use_ragged=False,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                )
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_wrappers_verify, False, False
+                )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
@@ -747,6 +772,121 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             raise ValueError("Invalid forward mode")
 
+    def _init_cascade_verify(self, forward_batch: ForwardBatch):
+        """Build 2-level cascade indices for tree verify and plan the wrappers.
+
+        Level 0: shared prefix KV (1 "request" per batch element, num_tokens queries)
+        Level 1: per-token ancestor chain (1 "request" per token, 1 query each)
+        """
+        spec_info = forward_batch.spec_info
+        bs = forward_batch.batch_size
+        num_tokens = spec_info.draft_token_num
+        seq_lens = forward_batch.seq_lens
+        req_pool_indices = forward_batch.req_pool_indices
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        device = seq_lens.device
+
+        # --- Extract tree-to-tree mask from FULL_MASK custom_mask ---
+        # Layout per batch element b: [num_tokens × (seq_lens[b] + num_tokens)]
+        # We want the last num_tokens columns (tree-to-tree portion)
+        tree_mask_tree = torch.zeros(
+            bs, num_tokens, num_tokens, dtype=torch.bool, device=device
+        )
+        offset = 0
+        for b in range(bs):
+            kv_len_b = int(seq_lens[b].item()) + num_tokens
+            mask_b = spec_info.custom_mask[offset : offset + num_tokens * kv_len_b]
+            mask_b = mask_b.reshape(num_tokens, kv_len_b)
+            tree_mask_tree[b] = mask_b[:, -num_tokens:]
+            offset += num_tokens * kv_len_b
+
+        # --- Level 0: prefix KV ---
+        qo_indptr_l0 = torch.arange(
+            0, (bs + 1) * num_tokens, num_tokens, dtype=torch.int32, device=device
+        )
+        kv_indptr_l0 = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        kv_indptr_l0[1:] = torch.cumsum(seq_lens.to(torch.int32), dim=0)
+        total_prefix = int(kv_indptr_l0[-1].item())
+        kv_indices_l0 = torch.empty(total_prefix, dtype=torch.int32, device=device)
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            seq_lens.to(torch.int32),
+            kv_indptr_l0,
+            None,
+            kv_indices_l0,
+            req_to_token.size(1),
+        )
+        kv_last_page_len_l0 = torch.ones(bs, dtype=torch.int32, device=device)
+
+        # --- Level 1: per-token ancestor chains ---
+        total_tree_queries = bs * num_tokens
+        qo_indptr_l1 = torch.arange(
+            total_tree_queries + 1, dtype=torch.int32, device=device
+        )
+        ancestor_counts = tree_mask_tree.sum(dim=2).to(torch.int32)  # [bs, num_tokens]
+        kv_indptr_l1 = torch.zeros(
+            total_tree_queries + 1, dtype=torch.int32, device=device
+        )
+        torch.cumsum(ancestor_counts.flatten(), dim=0, out=kv_indptr_l1[1:])
+        total_ancestor_pages = int(kv_indptr_l1[-1].item())
+        kv_indices_l1 = torch.empty(
+            total_ancestor_pages, dtype=torch.int32, device=device
+        )
+
+        idx = 0
+        for b in range(bs):
+            req_idx = req_pool_indices[b]
+            prefix_len = int(seq_lens[b].item())
+            for i in range(num_tokens):
+                anc_indices = tree_mask_tree[b, i].nonzero(as_tuple=True)[0]
+                pages = req_to_token[req_idx, prefix_len + anc_indices].to(torch.int32)
+                n = len(pages)
+                kv_indices_l1[idx : idx + n] = pages
+                idx += n
+
+        kv_last_page_len_l1 = torch.ones(
+            total_tree_queries, dtype=torch.int32, device=device
+        )
+
+        # --- Plan cascade wrappers ---
+        updater = self.indices_updater_prefill
+        for wrapper in self.cascade_verify_wrappers:
+            wrapper.plan(
+                qo_indptr_arr=[qo_indptr_l0, qo_indptr_l1],
+                paged_kv_indptr_arr=[kv_indptr_l0, kv_indptr_l1],
+                paged_kv_indices_arr=[kv_indices_l0, kv_indices_l1],
+                paged_kv_last_page_len=[kv_last_page_len_l0, kv_last_page_len_l1],
+                num_qo_heads=updater.num_qo_heads,
+                num_kv_heads=updater.num_kv_heads,
+                head_dim=updater.head_dim,
+                page_size=1,
+                causal=False,
+                q_data_type=updater.q_data_type,
+                kv_data_type=updater.data_type,
+            )
+
+        self.forward_metadata = CascadeVerifyMetadata(self.cascade_verify_wrappers)
+
+    def _forward_cascade_verify(
+        self, q, k, v, layer, forward_batch, save_kv_cache=True
+    ):
+        cascade_wrapper = self.forward_metadata.cascade_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+        cache_loc = forward_batch.out_cache_loc
+
+        if k is not None and v is not None and save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
+
+        o = cascade_wrapper.run(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
@@ -759,6 +899,11 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        if isinstance(self.forward_metadata, CascadeVerifyMetadata):
+            return self._forward_cascade_verify(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
