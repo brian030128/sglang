@@ -132,6 +132,16 @@ class DraftBackendFactory:
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
 
+        cascade_no_cg_val = os.environ.get("SGLANG_CASCADE_DRAFT_NO_CG")
+        if cascade_no_cg_val == "1":
+            from sglang.srt.layers.attention.flashinfer_cascade_backend import (
+                CascadeNoCGMultiStepDraftBackend,
+            )
+            print(f"[DraftBackendFactory] Creating CascadeNoCGMultiStepDraftBackend (pid={os.getpid()})", flush=True)
+            return CascadeNoCGMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
         cascade_val = os.environ.get("SGLANG_CASCADE_DRAFT")
         print(f"[DraftBackendFactory] SGLANG_CASCADE_DRAFT={cascade_val!r} (pid={os.getpid()})", flush=True)
         if cascade_val == "1":

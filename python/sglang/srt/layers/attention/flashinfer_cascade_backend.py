@@ -831,3 +831,12 @@ class CascadeMultiStepDraftBackend:
 
         nvtx_pop()
         return True
+
+
+class CascadeNoCGMultiStepDraftBackend(CascadeMultiStepDraftBackend):
+    """Cascade backend with CUDA graphs disabled for the attention kernel.
+
+    Used to measure the impact of CUDA graph support on attention performance.
+    """
+
+    supports_cuda_graph = False
