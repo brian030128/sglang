@@ -122,6 +122,16 @@ class DraftBackendFactory:
         return NativeSparseAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_flashinfer_decode_backend(self):
+        fasttree_val = os.environ.get("SGLANG_FASTTREE_DRAFT")
+        if fasttree_val == "1":
+            from sglang.srt.layers.attention.fasttree_backend import (
+                FastTreeMultiStepDraftBackend,
+            )
+            print(f"[DraftBackendFactory] Creating FastTreeMultiStepDraftBackend (pid={os.getpid()})", flush=True)
+            return FastTreeMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
         cascade_val = os.environ.get("SGLANG_CASCADE_DRAFT")
         print(f"[DraftBackendFactory] SGLANG_CASCADE_DRAFT={cascade_val!r} (pid={os.getpid()})", flush=True)
         if cascade_val == "1":

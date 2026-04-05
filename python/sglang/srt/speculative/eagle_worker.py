@@ -242,8 +242,10 @@ class EAGLEWorker(TpModelWorker):
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
         }
-        # Capture draft
-        if self.speculative_num_steps > 1:
+        # Capture draft (skip if backend doesn't support CUDA graphs, e.g. FastTree)
+        if self.speculative_num_steps > 1 and getattr(
+            self.draft_attn_backend, "supports_cuda_graph", True
+        ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
