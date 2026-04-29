@@ -662,9 +662,13 @@ class CascadeMultiStepDraftBackend:
         # per wrapper. This batches all Level 0 and Level 1 patches into one
         # scatter operation to minimize CUDA kernel launch overhead.
         idx_parts = []  # absolute positions in workspace buffer
-        n_l0_kv_len = 0  # count of L0 kv_len entries
-        n_l0_kv_end = 0  # count of L0 kv_end (last-chunk) entries
+        n_l0_kv_len = 0      # count of L0 kv_len entries
+        n_l0_kv_end = 0      # count of L0 kv_end (last-chunk) entries
+        n_l0_kv_indptr = 0   # count of L0 kv_indptr entries (== n_l0_kv_len)
         l1_bases = []  # base kv_indptr values for L1 items
+        l0_kv_len_seq_idx_parts = []     # per-item seq idx for L0 kv_len entries
+        l0_kv_end_seq_idx_parts = []     # per-item seq idx for L0 kv_end entries
+        l0_kv_indptr_seq_idx_parts = []  # per-item seq idx for L0 kv_indptr entries
 
         for task in range(2):
             task_base = 2 + task * 12
@@ -684,8 +688,19 @@ class CascadeMultiStepDraftBackend:
                 t_kv_start_s = last_wrapper._plan_info[task_base + 6] // 4
                 l0_idx = torch.where(l0_mask)[0]
 
+                # Map each L0 work item to its sequence index. C++ scheduler
+                # stores adjusted_kv_indptr = kv_indptr_h_arr[0][i] for level 0
+                # (level_offsets[0] = 0); chunking does not shift kv_indptr.
+                # kv_indptr value == kv_indptr_shared_cpu[seq_idx], so
+                # searchsorted(..., right=True) - 1 recovers seq_idx exactly.
+                l0_kv_indptr_vals = t_kv_indptrs[l0_idx]
+                l0_seq_idx = torch.searchsorted(
+                    kv_indptr_shared_cpu, l0_kv_indptr_vals, right=True
+                ) - 1
+
                 # L0 kv_len: all Level 0 items
                 idx_parts.append(torch.tensor(t_kv_len_s, device="cpu") + l0_idx)
+                l0_kv_len_seq_idx_parts.append(l0_seq_idx)
                 n_l0_kv_len += l0_idx.numel()
 
                 # L0 kv_end: only last-chunk items (partial chunks)
@@ -698,7 +713,16 @@ class CascadeMultiStepDraftBackend:
                     idx_parts.append(
                         torch.tensor(t_kv_end_s, device="cpu") + last_chunk
                     )
+                    l0_kv_end_seq_idx_parts.append(l0_seq_idx[last_mask])
                     n_l0_kv_end += last_chunk.numel()
+
+                # L0 kv_indptr: all Level 0 items. The captured value points
+                # into the kv_indices buffer using capture-time seq_lens; at
+                # replay seq_lens differ so each item must be rewritten to
+                # the new cumsum-based offset for its sequence.
+                idx_parts.append(torch.tensor(t_kv_indptr_s, device="cpu") + l0_idx)
+                l0_kv_indptr_seq_idx_parts.append(l0_seq_idx)
+                n_l0_kv_indptr += l0_idx.numel()
 
             # Level 1 items: kv_indptr >= shared_offset
             l1_mask = t_kv_indptrs >= level2_offset
@@ -721,13 +745,30 @@ class CascadeMultiStepDraftBackend:
                 0, dtype=torch.long, device=self.device
             )
 
-        # Layout: [l0_kv_len (n_l0_kv_len) | l0_kv_end (n_l0_kv_end) | l1_kv_indptr]
+        # Layout: [l0_kv_len | l0_kv_end | l0_kv_indptr | l1_kv_indptr]
         self._replay_n_l0_kv_len = n_l0_kv_len
         self._replay_n_l0_kv_end = n_l0_kv_end
+        self._replay_n_l0_kv_indptr = n_l0_kv_indptr
         self._replay_l1_kv_indptr_base = (
             torch.cat(l1_bases).to(device=self.device, dtype=torch.int32)
             if l1_bases
             else torch.empty(0, dtype=torch.int32, device=self.device)
+        )
+        # Per-seq idx tensors for fast-replay gather of seq_lens / cumsum
+        self._replay_l0_kv_len_seq_idx = (
+            torch.cat(l0_kv_len_seq_idx_parts).to(device=self.device, dtype=torch.long)
+            if l0_kv_len_seq_idx_parts
+            else torch.empty(0, dtype=torch.long, device=self.device)
+        )
+        self._replay_l0_kv_end_seq_idx = (
+            torch.cat(l0_kv_end_seq_idx_parts).to(device=self.device, dtype=torch.long)
+            if l0_kv_end_seq_idx_parts
+            else torch.empty(0, dtype=torch.long, device=self.device)
+        )
+        self._replay_l0_kv_indptr_seq_idx = (
+            torch.cat(l0_kv_indptr_seq_idx_parts).to(device=self.device, dtype=torch.long)
+            if l0_kv_indptr_seq_idx_parts
+            else torch.empty(0, dtype=torch.long, device=self.device)
         )
         # Pre-allocate values buffer
         self._replay_all_values = torch.empty(
@@ -736,9 +777,15 @@ class CascadeMultiStepDraftBackend:
             device=self.device,
         )
 
-        max_prefix = int(seq_lens_cpu.max().item())
+        # Per-seq chunk counts. Any seq crossing a kv_limit boundary forces
+        # a full re-plan (work-item assignment changes). The previous
+        # ceil_div(max_prefix, kv_limit) check missed this for non-max seqs.
         self._replay_kv_limit = kv_limit
-        self._replay_num_chunks = -(-max_prefix // kv_limit)  # ceil_div
+        self._replay_per_seq_chunks_cpu = torch.div(
+            seq_lens_cpu.to(torch.int64) + (kv_limit - 1),
+            kv_limit,
+            rounding_mode="floor",
+        )
         self._replay_unique_len = kv_indices_unique.shape[0]
 
     def _cuda_graph_fast_replay(self, forward_batch: ForwardBatch) -> bool:
@@ -761,11 +808,16 @@ class CascadeMultiStepDraftBackend:
             seq_lens_cpu = seq_lens.to("cpu")
             torch.cuda.synchronize()
 
-        # Check chunk count stability
-        max_prefix = int(seq_lens_cpu.max().item())
+        # Per-seq chunk-count stability: any seq crossing a kv_limit boundary
+        # changes the C++ scheduler's work-item assignment, invalidating the
+        # captured replay layout. CPU-only check, no GPU sync.
         kv_limit = self._replay_kv_limit
-        new_num_chunks = -(-max_prefix // kv_limit)  # ceil_div
-        if new_num_chunks != self._replay_num_chunks:
+        new_per_seq_chunks = torch.div(
+            seq_lens_cpu.to(torch.int64) + (kv_limit - 1),
+            kv_limit,
+            rounding_mode="floor",
+        )
+        if not torch.equal(new_per_seq_chunks, self._replay_per_seq_chunks_cpu):
             return False
 
         req_pool_indices = forward_batch.req_pool_indices
@@ -779,12 +831,16 @@ class CascadeMultiStepDraftBackend:
         )
 
         nvtx_push("cascade/fast_replay")
+        # Capture kv_indptr_shared_gpu for L0 kv_indptr update.
+        kv_indptr_shared_gpu = torch.empty(
+            num_seqs + 1, dtype=torch.int32, device=self.device
+        )
         generate_cascade_shared_kv_indices[(num_seqs,)](
             req_pool_indices,
             req_to_token,
             seq_lens,
             kv_indices_shared,
-            torch.empty(num_seqs + 1, dtype=torch.int32, device=self.device),
+            kv_indptr_shared_gpu,
             self.pool_len,
             next_power_of_2(num_seqs),
             128,
@@ -812,17 +868,23 @@ class CascadeMultiStepDraftBackend:
         )
 
         # --- Patch workspace in each wrapper (single scatter per wrapper) ---
-        # Build values tensor: [l0_kv_len... | l0_kv_end... | l1_kv_indptr...]
-        new_prefix_i32 = seq_lens[0].to(torch.int32)
+        # Layout: [l0_kv_len | l0_kv_end | l0_kv_indptr | l1_kv_indptr]
+        # L0 kv_indptr must also be updated: capture-time uniform seq_lens
+        # produced i*L_capture, but the new kv_indices buffer is laid out as
+        # cumsum(seq_lens_now), so each L0 item's offset shifts.
+        seq_lens_i32 = seq_lens.to(torch.int32)
         vals = self._replay_all_values
         s0 = self._replay_n_l0_kv_len
         s1 = s0 + self._replay_n_l0_kv_end
+        s2 = s1 + self._replay_n_l0_kv_indptr
         if s0 > 0:
-            vals[:s0] = new_prefix_i32 + self.topk
+            vals[:s0] = seq_lens_i32[self._replay_l0_kv_len_seq_idx] + self.topk
         if s1 > s0:
-            vals[s0:s1] = new_prefix_i32
-        if s1 < vals.numel():
-            vals[s1:] = self._replay_l1_kv_indptr_base + new_shared_len
+            vals[s0:s1] = seq_lens_i32[self._replay_l0_kv_end_seq_idx]
+        if s2 > s1:
+            vals[s1:s2] = kv_indptr_shared_gpu[self._replay_l0_kv_indptr_seq_idx]
+        if s2 < vals.numel():
+            vals[s2:] = self._replay_l1_kv_indptr_base + new_shared_len
 
         all_idx = self._replay_all_indices
         for backend in self.attn_backends:
