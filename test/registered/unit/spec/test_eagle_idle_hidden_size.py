@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.test.test_utils import CustomTestCase
@@ -69,7 +68,9 @@ class TestEagleIdleHiddenSize(CustomTestCase):
                 )
                 self.assertEqual(batch.spec_info.hidden_states.dtype, DTYPE)
 
-                real = _make_real_target_input(batch_size=3, target_hidden=target_hidden)
+                real = _make_real_target_input(
+                    batch_size=3, target_hidden=target_hidden
+                )
                 real.merge_batch(batch.spec_info)
                 self.assertEqual(real.hidden_states.shape, (3, target_hidden))
 
@@ -79,8 +80,10 @@ class TestEagleIdleHiddenSize(CustomTestCase):
         src = inspect.getsource(EAGLEWorker.forward_draft_extend_after_decode)
 
         guard_match = re.search(r"verified_id\.numel\(\)\s*==\s*0", src)
-        self.assertIsNotNone(guard_match, "idle-fallback guard not found; test is stale")
-        fallback_block = src[guard_match.start():]
+        self.assertIsNotNone(
+            guard_match, "idle-fallback guard not found; test is stale"
+        )
+        fallback_block = src[guard_match.start() :]
 
         call_match = re.search(
             r"EagleDraftInput\.create_idle_input\([^)]*\)", fallback_block, re.DOTALL
