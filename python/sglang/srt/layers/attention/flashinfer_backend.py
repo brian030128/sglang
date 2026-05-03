@@ -1734,6 +1734,9 @@ class FlashInferMultiStepDraftBackend:
         nvtx_pop()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if os.environ.get("SGLANG_DEBUG_PLAN_TIMING") == "1":
+            import time as _t
+            _t0 = _t.perf_counter_ns()
         kv_indices = torch.empty(
             (
                 self.speculative_num_steps,
@@ -1753,6 +1756,19 @@ class FlashInferMultiStepDraftBackend:
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
         self.common_template(forward_batch, kv_indices, call_fn)
+
+        if os.environ.get("SGLANG_DEBUG_PLAN_TIMING") == "1":
+            _t1 = _t.perf_counter_ns()
+            if not hasattr(self, "_plan_ns_total"):
+                self._plan_ns_total = 0
+                self._plan_count = 0
+            self._plan_ns_total += (_t1 - _t0)
+            self._plan_count += 1
+            if self._plan_count in (1, 2, 5, 10, 20, 50) or self._plan_count % 100 == 0:
+                steady_avg_us = (self._plan_ns_total - getattr(self, "_plan_ns_first", 0)) / max(1, self._plan_count - 1) / 1000
+                print(f"[FLAT plan] count={self._plan_count} avg_all={self._plan_ns_total/self._plan_count/1000:.1f}us steady_avg={steady_avg_us:.1f}us total={self._plan_ns_total/1e6:.1f}ms", flush=True)
+            if self._plan_count == 1:
+                self._plan_ns_first = (_t1 - _t0)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.cuda_graph_kv_indices = torch.zeros(
@@ -1796,6 +1812,16 @@ class FlashInferMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+
+class FlashInferNoCGMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
+    """Flat flashinfer draft backend with CUDA graphs disabled for the attention kernel.
+
+    Used to measure the impact of CUDA graph support on attention performance,
+    matching CascadeNoCGMultiStepDraftBackend for fair comparison.
+    """
+
+    supports_cuda_graph = False
 
 
 def should_use_tensor_core(

@@ -312,7 +312,24 @@ class CascadeMultiStepDraftBackend:
             backend._step_updated = False
 
         nvtx_push("cascade/plan_for_draft")
-        self._plan_once_for_all_steps(forward_batch, first_call)
+        if os.environ.get("SGLANG_DEBUG_PLAN_TIMING") == "1":
+            import time as _t
+            _t0 = _t.perf_counter_ns()
+            self._plan_once_for_all_steps(forward_batch, first_call)
+            _t1 = _t.perf_counter_ns()
+            if not hasattr(self, "_plan_ns_total"):
+                self._plan_ns_total = 0
+                self._plan_count = 0
+            self._plan_ns_total += (_t1 - _t0)
+            self._plan_count += 1
+            if self._plan_count in (1, 2, 5, 10, 20, 50) or self._plan_count % 100 == 0:
+                # Skip first call from steady-state avg
+                steady_avg_us = (self._plan_ns_total - getattr(self, "_plan_ns_first", 0)) / max(1, self._plan_count - 1) / 1000
+                print(f"[CASCADE plan] count={self._plan_count} avg_all={self._plan_ns_total/self._plan_count/1000:.1f}us steady_avg={steady_avg_us:.1f}us total={self._plan_ns_total/1e6:.1f}ms", flush=True)
+            if self._plan_count == 1:
+                self._plan_ns_first = (_t1 - _t0)
+        else:
+            self._plan_once_for_all_steps(forward_batch, first_call)
         nvtx_pop()
         self._modules_initialized = True
 
@@ -900,5 +917,152 @@ class CascadeNoCGMultiStepDraftBackend(CascadeMultiStepDraftBackend):
 
     Used to measure the impact of CUDA graph support on attention performance.
     """
+
+    supports_cuda_graph = False
+
+
+class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
+    """Cascade backend with per-step planning (one cascade_plan per step).
+
+    Ablation variant: same kernel as cascade, but plans N-1 times per iteration
+    on per-step wrappers instead of plan_for_draft() once + update_draft_step
+    per step. Isolates the kernel speedup from the planning amortization.
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        # Skip parent __init__ (which sets up the shared wrapper); set up
+        # per-step wrappers instead.
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.page_size = model_runner.page_size
+        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.device = model_runner.device
+        self.max_context_len = model_runner.model_config.context_len
+
+        # Per-step wrappers — one cascade_plan per step per iteration.
+        # step_index=None disables update_draft_step (each wrapper owns its own plan).
+        self.attn_backends: List[CascadeDraftAttnBackend] = []
+        for _ in range(self.speculative_num_steps - 1):
+            wrapper = CascadeBatchAttention(
+                num_levels=2,
+                kv_layout="NHD",
+                device="cuda",
+            )
+            self.attn_backends.append(
+                CascadeDraftAttnBackend(model_runner, wrapper, step_index=None)
+            )
+
+        self._modules_initialized = False
+        self._debug_logged = False
+
+    def _per_step_call_fn(self, i, *, qo_indptr_shared_cpu, qo_indptr_unique_cpu,
+                          kv_indptr_shared_cpu, kv_indptr_unique_cpu,
+                          kv_indices_shared, kv_indices_unique,
+                          kv_len_shared_cpu, kv_len_unique_cpu):
+        backend = self.attn_backends[i]
+        wrapper = backend.cascade_attn
+        common = dict(
+            num_qo_heads=backend.num_qo_heads,
+            num_kv_heads=backend.num_kv_heads,
+            head_dim_qk=backend.head_dim,
+            head_dim_vo=backend.head_dim,
+            page_size=1,
+            causal=False,
+            sm_scale=None,
+            q_data_type=backend.q_data_type,
+            kv_data_type=backend.data_type,
+        )
+        if not getattr(wrapper, "_module_initialized", False):
+            wrapper.plan(
+                qo_indptr_arr=[qo_indptr_shared_cpu, qo_indptr_unique_cpu],
+                kv_indptr_arr=[kv_indptr_shared_cpu, kv_indptr_unique_cpu],
+                kv_indices_arr=[kv_indices_shared, kv_indices_unique],
+                kv_len_arr=[kv_len_shared_cpu, kv_len_unique_cpu],
+                **common,
+            )
+            wrapper._module_initialized = True
+        else:
+            wrapper.fast_cascade_plan(
+                qo_indptr_host_arr=[qo_indptr_shared_cpu, qo_indptr_unique_cpu],
+                kv_indptr_host_arr=[kv_indptr_shared_cpu, kv_indptr_unique_cpu],
+                kv_indices_arr=[kv_indices_shared, kv_indices_unique],
+                kv_len_host_arr=[kv_len_shared_cpu, kv_len_unique_cpu],
+                **common,
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        nvtx_push("cascade_per_step/plan_per_step")
+        if os.environ.get("SGLANG_DEBUG_PLAN_TIMING") == "1":
+            import time as _t
+            _t0 = _t.perf_counter_ns()
+            self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
+            _t1 = _t.perf_counter_ns()
+            if not hasattr(self, "_plan_ns_total"):
+                self._plan_ns_total = 0
+                self._plan_count = 0
+            self._plan_ns_total += (_t1 - _t0)
+            self._plan_count += 1
+            if self._plan_count in (1, 2, 5, 10, 20, 50) or self._plan_count % 100 == 0:
+                steady_avg_us = (self._plan_ns_total - getattr(self, "_plan_ns_first", 0)) / max(1, self._plan_count - 1) / 1000
+                print(f"[CASCADE_PER_STEP plan] count={self._plan_count} avg_all={self._plan_ns_total/self._plan_count/1000:.1f}us steady_avg={steady_avg_us:.1f}us total={self._plan_ns_total/1e6:.1f}ms", flush=True)
+            if self._plan_count == 1:
+                self._plan_ns_first = (_t1 - _t0)
+        else:
+            self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
+        nvtx_pop()
+        self._modules_initialized = True
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        max_branches = max_bs * self.topk
+        max_shared_pages = max_bs * self.max_context_len
+        max_unique_pages = max_branches * self.speculative_num_steps
+        max_total_pages = max_shared_pages + max_unique_pages
+
+        self.cuda_graph_kv_indices_buf = torch.zeros(
+            max_total_pages, dtype=torch.int32, device="cuda"
+        )
+
+        # Recreate per-step wrappers with use_cuda_graph=True
+        for i in range(self.speculative_num_steps - 1):
+            old = self.attn_backends[i]
+            new = CascadeDraftAttnBackend.__new__(CascadeDraftAttnBackend)
+            new.num_qo_heads = old.num_qo_heads
+            new.num_kv_heads = old.num_kv_heads
+            new.head_dim = old.head_dim
+            new.data_type = old.data_type
+            new.q_data_type = old.q_data_type
+            new.max_context_len = old.max_context_len
+            new._step_index = None
+            new._step_updated = False
+            new.cascade_attn = CascadeBatchAttention(
+                num_levels=2,
+                kv_layout="NHD",
+                device="cuda",
+                use_cuda_graph=True,
+                kv_indices_buffer=self.cuda_graph_kv_indices_buf,
+            )
+            self.attn_backends[i] = new
+        self._modules_initialized = False
+
+    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        nvtx_push("cascade_per_step/cg_capture_plan")
+        self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
+        nvtx_pop()
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        nvtx_push("cascade_per_step/cg_replay_plan")
+        self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
+        nvtx_pop()
+
+
+class CascadePerStepNoCGMultiStepDraftBackend(CascadePerStepMultiStepDraftBackend):
+    """Per-step-plan cascade backend with CUDA graphs disabled."""
 
     supports_cuda_graph = False

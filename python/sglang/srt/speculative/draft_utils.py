@@ -142,6 +142,36 @@ class DraftBackendFactory:
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
 
+        cascade_per_step_no_cg_val = os.environ.get("SGLANG_CASCADE_PER_STEP_DRAFT_NO_CG")
+        if cascade_per_step_no_cg_val == "1":
+            from sglang.srt.layers.attention.flashinfer_cascade_backend import (
+                CascadePerStepNoCGMultiStepDraftBackend,
+            )
+            print(f"[DraftBackendFactory] Creating CascadePerStepNoCGMultiStepDraftBackend (pid={os.getpid()})", flush=True)
+            return CascadePerStepNoCGMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
+        cascade_per_step_val = os.environ.get("SGLANG_CASCADE_PER_STEP_DRAFT")
+        if cascade_per_step_val == "1":
+            from sglang.srt.layers.attention.flashinfer_cascade_backend import (
+                CascadePerStepMultiStepDraftBackend,
+            )
+            print(f"[DraftBackendFactory] Creating CascadePerStepMultiStepDraftBackend (pid={os.getpid()})", flush=True)
+            return CascadePerStepMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
+        flat_no_cg_val = os.environ.get("SGLANG_FLAT_DRAFT_NO_CG")
+        if flat_no_cg_val == "1":
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferNoCGMultiStepDraftBackend,
+            )
+            print(f"[DraftBackendFactory] Creating FlashInferNoCGMultiStepDraftBackend (pid={os.getpid()})", flush=True)
+            return FlashInferNoCGMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
         cascade_val = os.environ.get("SGLANG_CASCADE_DRAFT")
         print(f"[DraftBackendFactory] SGLANG_CASCADE_DRAFT={cascade_val!r} (pid={os.getpid()})", flush=True)
         if cascade_val == "1":
