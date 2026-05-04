@@ -35,8 +35,6 @@ from sglang.srt.speculative.cascade_index_gen import (
     generate_cascade_shared_kv_indices,
     next_power_of_2,
 )
-from sglang.srt.speculative.draft_utils import nvtx_pop, nvtx_push
-
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -79,8 +77,6 @@ class CascadeDraftAttnBackend(AttentionBackend):
         # Planning is done by the parent CascadeMultiStepDraftBackend
         pass
 
-    _debug_decode_logged = False
-
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -108,17 +104,6 @@ class CascadeDraftAttnBackend(AttentionBackend):
 
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        if not CascadeDraftAttnBackend._debug_decode_logged and os.environ.get("SGLANG_DEBUG_DRAFT_PARAMS") == "1":
-            CascadeDraftAttnBackend._debug_decode_logged = True
-            if isinstance(kv_cache, tuple):
-                kv_shapes = [t.shape for t in kv_cache]
-            else:
-                kv_shapes = kv_cache.shape
-            print(f"\n[CASCADE DRAFT] forward_decode (pid={os.getpid()}, layer={layer.layer_id})", flush=True)
-            print(f"  q.shape={q_reshaped.shape} (num_qo_heads={layer.tp_q_head_num}, head_dim={layer.head_dim})", flush=True)
-            print(f"  kv_data shapes={kv_shapes}", flush=True)
-            print(f"  num_kv_heads={layer.tp_k_head_num}, scaling={layer.scaling}", flush=True)
 
         o, _ = self.cascade_attn.run(
             q_reshaped,
@@ -173,7 +158,6 @@ class CascadeMultiStepDraftBackend:
             )
 
         self._modules_initialized = False
-        self._debug_logged = False
 
     def _build_cascade_indices_and_plan(
         self,
@@ -230,7 +214,6 @@ class CascadeMultiStepDraftBackend:
             next_power_of_2,
         )
 
-        nvtx_push("cascade/shared_indices")
         generate_cascade_shared_kv_indices[(num_seqs,)](
             req_pool_indices,
             req_to_token,
@@ -241,21 +224,6 @@ class CascadeMultiStepDraftBackend:
             next_power_of_2(num_seqs),
             128,  # BLOCK_SIZE
         )
-        nvtx_pop()
-
-        _do_debug = not self._debug_logged and os.environ.get("SGLANG_DEBUG_DRAFT_PARAMS") == "1" and int(kv_indptr_shared_cpu[-1].item()) > total_branches
-        if _do_debug:
-            self._debug_logged = True
-            print(f"\n[CASCADE DRAFT] _build_cascade_indices_and_plan (pid={os.getpid()})", flush=True)
-            print(f"  num_seqs={num_seqs}, topk={self.topk}, total_branches={total_branches}", flush=True)
-            print(f"  speculative_num_steps={self.speculative_num_steps}, page_size={self.page_size}", flush=True)
-            print(f"  seq_lens={seq_lens_cpu.tolist()}", flush=True)
-            print(f"  SHARED: kv_indices_shared.shape={kv_indices_shared.shape}, "
-                  f"first20={kv_indices_shared[:20].cpu().tolist()}, "
-                  f"last10={kv_indices_shared[-10:].cpu().tolist()}", flush=True)
-            print(f"  SHARED: kv_indptr={kv_indptr_shared_cpu.tolist()}", flush=True)
-            print(f"  SHARED: kv_len={kv_len_shared_cpu.tolist()}", flush=True)
-            print(f"  SHARED: qo_indptr={qo_indptr_shared_cpu.tolist()}", flush=True)
 
         # --- Per-step: build unique indices and plan ---
         for i in range(self.speculative_num_steps - 1):
@@ -271,7 +239,6 @@ class CascadeMultiStepDraftBackend:
             )[: total_branches + 1]
 
             # Level 2 GPU: unique suffix indices from Triton
-            nvtx_push(f"cascade/step_{i}_unique_indices")
             _, kv_indices_unique, _ = build_unique_indices(
                 req_pool_indices,
                 req_to_token,
@@ -283,14 +250,6 @@ class CascadeMultiStepDraftBackend:
                 self.device,
                 self.pool_len,
             )
-            nvtx_pop()
-
-            if _do_debug:
-                print(f"  UNIQUE step {i}: kv_indices_unique.shape={kv_indices_unique.shape}, "
-                      f"values={kv_indices_unique.cpu().tolist()}", flush=True)
-                print(f"  UNIQUE step {i}: kv_indptr={kv_indptr_unique_cpu.tolist()}", flush=True)
-                print(f"  UNIQUE step {i}: kv_len={kv_len_unique_cpu.tolist()}", flush=True)
-                print(f"  UNIQUE step {i}: qo_indptr={qo_indptr_unique_cpu.tolist()}", flush=True)
 
             call_fn(
                 i,
@@ -311,26 +270,7 @@ class CascadeMultiStepDraftBackend:
         for backend in self.attn_backends:
             backend._step_updated = False
 
-        nvtx_push("cascade/plan_for_draft")
-        if os.environ.get("SGLANG_DEBUG_PLAN_TIMING") == "1":
-            import time as _t
-            _t0 = _t.perf_counter_ns()
-            self._plan_once_for_all_steps(forward_batch, first_call)
-            _t1 = _t.perf_counter_ns()
-            if not hasattr(self, "_plan_ns_total"):
-                self._plan_ns_total = 0
-                self._plan_count = 0
-            self._plan_ns_total += (_t1 - _t0)
-            self._plan_count += 1
-            if self._plan_count in (1, 2, 5, 10, 20, 50) or self._plan_count % 100 == 0:
-                # Skip first call from steady-state avg
-                steady_avg_us = (self._plan_ns_total - getattr(self, "_plan_ns_first", 0)) / max(1, self._plan_count - 1) / 1000
-                print(f"[CASCADE plan] count={self._plan_count} avg_all={self._plan_ns_total/self._plan_count/1000:.1f}us steady_avg={steady_avg_us:.1f}us total={self._plan_ns_total/1e6:.1f}ms", flush=True)
-            if self._plan_count == 1:
-                self._plan_ns_first = (_t1 - _t0)
-        else:
-            self._plan_once_for_all_steps(forward_batch, first_call)
-        nvtx_pop()
+        self._plan_once_for_all_steps(forward_batch, first_call)
         self._modules_initialized = True
 
     def _plan_once_for_all_steps(self, forward_batch: ForwardBatch, first_call: bool):
@@ -392,7 +332,6 @@ class CascadeMultiStepDraftBackend:
             next_power_of_2,
         )
 
-        nvtx_push("cascade/shared_indices")
         generate_cascade_shared_kv_indices[(num_seqs,)](
             req_pool_indices,
             req_to_token,
@@ -403,10 +342,8 @@ class CascadeMultiStepDraftBackend:
             next_power_of_2(num_seqs),
             128,  # BLOCK_SIZE
         )
-        nvtx_pop()
 
         # --- GPU: unique suffix indices at max depth (1 Triton kernel) ---
-        nvtx_push("cascade/unique_indices_max")
         _, kv_indices_unique, _ = build_unique_indices(
             req_pool_indices,
             req_to_token,
@@ -418,7 +355,6 @@ class CascadeMultiStepDraftBackend:
             self.device,
             self.pool_len,
         )
-        nvtx_pop()
 
         # --- plan_for_draft: 1 cascade_plan call ---
         backend = self.attn_backends[0]
@@ -539,7 +475,6 @@ class CascadeMultiStepDraftBackend:
             actual_total_prefix, dtype=torch.int32, device=self.device
         )
 
-        nvtx_push("cascade/shared_indices")
         generate_cascade_shared_kv_indices[(num_seqs,)](
             req_pool_indices,
             req_to_token,
@@ -550,10 +485,8 @@ class CascadeMultiStepDraftBackend:
             next_power_of_2(num_seqs),
             128,
         )
-        nvtx_pop()
 
         # --- GPU: unique suffix indices at max depth (1 Triton kernel) ---
-        nvtx_push("cascade/unique_indices_max")
         _, kv_indices_unique, _ = build_unique_indices(
             req_pool_indices,
             req_to_token,
@@ -565,7 +498,6 @@ class CascadeMultiStepDraftBackend:
             self.device,
             self.pool_len,
         )
-        nvtx_pop()
 
         # --- Plan ONCE on last wrapper ---
         last_idx = len(self.attn_backends) - 1
@@ -584,7 +516,6 @@ class CascadeMultiStepDraftBackend:
             kv_data_type=last_backend.data_type,
         )
 
-        nvtx_push("cascade/cuda_graph_plan")
         if use_fast_plan:
             last_wrapper.fast_cascade_plan(
                 qo_indptr_host_arr=[qo_indptr_shared_cpu, qo_indptr_unique_cpu],
@@ -656,7 +587,6 @@ class CascadeMultiStepDraftBackend:
             buf[l1_kv_len_start + level2_indices] = step_offset + 1
             buf[l1_kv_end_start + level2_indices] = step_offset
 
-        nvtx_pop()
         self._modules_initialized = True
 
         # --- Save replay layout for fast_replay ---
@@ -847,7 +777,6 @@ class CascadeMultiStepDraftBackend:
             actual_total_prefix, dtype=torch.int32, device=self.device
         )
 
-        nvtx_push("cascade/fast_replay")
         # Capture kv_indptr_shared_gpu for L0 kv_indptr update.
         kv_indptr_shared_gpu = torch.empty(
             num_seqs + 1, dtype=torch.int32, device=self.device
@@ -908,7 +837,6 @@ class CascadeMultiStepDraftBackend:
             buf = backend.cascade_attn.int_workspace_buffer.view(torch.int32)
             buf[all_idx] = vals
 
-        nvtx_pop()
         return True
 
 
@@ -958,7 +886,6 @@ class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
             )
 
         self._modules_initialized = False
-        self._debug_logged = False
 
     def _per_step_call_fn(self, i, *, qo_indptr_shared_cpu, qo_indptr_unique_cpu,
                           kv_indptr_shared_cpu, kv_indptr_unique_cpu,
@@ -977,7 +904,10 @@ class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
             q_data_type=backend.q_data_type,
             kv_data_type=backend.data_type,
         )
-        if not getattr(wrapper, "_module_initialized", False):
+        # Default off: every step runs the full plan() (with sync). Set to "1" to
+        # use fast_cascade_plan() after the first call (skips JIT lookup + sync).
+        use_fast_plan = os.environ.get("SGLANG_CASCADE_PER_STEP_FAST_PLAN") == "1"
+        if not use_fast_plan or not getattr(wrapper, "_module_initialized", False):
             wrapper.plan(
                 qo_indptr_arr=[qo_indptr_shared_cpu, qo_indptr_unique_cpu],
                 kv_indptr_arr=[kv_indptr_shared_cpu, kv_indptr_unique_cpu],
@@ -996,25 +926,7 @@ class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        nvtx_push("cascade_per_step/plan_per_step")
-        if os.environ.get("SGLANG_DEBUG_PLAN_TIMING") == "1":
-            import time as _t
-            _t0 = _t.perf_counter_ns()
-            self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
-            _t1 = _t.perf_counter_ns()
-            if not hasattr(self, "_plan_ns_total"):
-                self._plan_ns_total = 0
-                self._plan_count = 0
-            self._plan_ns_total += (_t1 - _t0)
-            self._plan_count += 1
-            if self._plan_count in (1, 2, 5, 10, 20, 50) or self._plan_count % 100 == 0:
-                steady_avg_us = (self._plan_ns_total - getattr(self, "_plan_ns_first", 0)) / max(1, self._plan_count - 1) / 1000
-                print(f"[CASCADE_PER_STEP plan] count={self._plan_count} avg_all={self._plan_ns_total/self._plan_count/1000:.1f}us steady_avg={steady_avg_us:.1f}us total={self._plan_ns_total/1e6:.1f}ms", flush=True)
-            if self._plan_count == 1:
-                self._plan_ns_first = (_t1 - _t0)
-        else:
-            self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
-        nvtx_pop()
+        self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
         self._modules_initialized = True
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -1023,12 +935,19 @@ class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
         max_unique_pages = max_branches * self.speculative_num_steps
         max_total_pages = max_shared_pages + max_unique_pages
 
+        # Per-step variant: every wrapper plans independently and writes its
+        # own kv_indices into _kv_indices_buf. The plan-once parent shares one
+        # buffer because only the LAST wrapper plans (the rest patch into the
+        # shared workspace), but here all wrappers plan, so they need disjoint
+        # buffers — otherwise step i+1's plan clobbers step i's indices and
+        # the captured kernel for step i reads the wrong pages at replay
+        # (manifests as a lower spec_accept_length without a hard crash).
+        num_steps = self.speculative_num_steps - 1
         self.cuda_graph_kv_indices_buf = torch.zeros(
-            max_total_pages, dtype=torch.int32, device="cuda"
+            max_total_pages * num_steps, dtype=torch.int32, device="cuda"
         )
 
-        # Recreate per-step wrappers with use_cuda_graph=True
-        for i in range(self.speculative_num_steps - 1):
+        for i in range(num_steps):
             old = self.attn_backends[i]
             new = CascadeDraftAttnBackend.__new__(CascadeDraftAttnBackend)
             new.num_qo_heads = old.num_qo_heads
@@ -1039,27 +958,26 @@ class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
             new.max_context_len = old.max_context_len
             new._step_index = None
             new._step_updated = False
+            per_step_buf = self.cuda_graph_kv_indices_buf[
+                i * max_total_pages : (i + 1) * max_total_pages
+            ]
             new.cascade_attn = CascadeBatchAttention(
                 num_levels=2,
                 kv_layout="NHD",
                 device="cuda",
                 use_cuda_graph=True,
-                kv_indices_buffer=self.cuda_graph_kv_indices_buf,
+                kv_indices_buffer=per_step_buf,
             )
             self.attn_backends[i] = new
         self._modules_initialized = False
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        nvtx_push("cascade_per_step/cg_capture_plan")
         self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
-        nvtx_pop()
 
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        nvtx_push("cascade_per_step/cg_replay_plan")
         self._build_cascade_indices_and_plan(forward_batch, self._per_step_call_fn)
-        nvtx_pop()
 
 
 class CascadePerStepNoCGMultiStepDraftBackend(CascadePerStepMultiStepDraftBackend):

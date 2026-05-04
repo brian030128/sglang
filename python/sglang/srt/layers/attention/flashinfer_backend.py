@@ -25,7 +25,6 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.draft_utils import nvtx_pop, nvtx_push
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
@@ -295,7 +294,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Cascade verify backend (toggled by SGLANG_CASCADE_VERIFY=1)
         self._cascade_verify = os.environ.get("SGLANG_CASCADE_VERIFY") == "1"
-        print(f"[DEBUG] _cascade_verify = {self._cascade_verify}  (SGLANG_CASCADE_VERIFY={os.environ.get('SGLANG_CASCADE_VERIFY', 'unset')})")
         self._page_size = model_runner.page_size
         if self._cascade_verify and not skip_prefill:
             from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
@@ -1009,8 +1007,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
-    _debug_decode_logged = False
-
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1038,17 +1034,6 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         kv_data = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-
-        if not FlashInferAttnBackend._debug_decode_logged and os.environ.get("SGLANG_DEBUG_DRAFT_PARAMS") == "1":
-            FlashInferAttnBackend._debug_decode_logged = True
-            if isinstance(kv_data, tuple):
-                kv_shapes = [t.shape for t in kv_data]
-            else:
-                kv_shapes = kv_data.shape
-            print(f"\n[FLAT DRAFT] forward_decode (pid={os.getpid()}, layer={layer.layer_id})", flush=True)
-            print(f"  q.shape={q_reshaped.shape} (num_qo_heads={layer.tp_q_head_num}, head_dim={layer.head_dim})", flush=True)
-            print(f"  kv_data shapes={kv_shapes}", flush=True)
-            print(f"  num_kv_heads={layer.tp_k_head_num}, scaling={layer.scaling}", flush=True)
 
         # Call the wrapped function
         o = decode_wrapper.forward(
@@ -1669,7 +1654,6 @@ class FlashInferMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
-        self._debug_logged = False
 
     def common_template(
         self,
@@ -1677,7 +1661,6 @@ class FlashInferMultiStepDraftBackend:
         kv_indices_buffer: torch.Tensor,
         call_fn: Callable,
     ):
-        nvtx_push("flat/plan")
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum
@@ -1707,21 +1690,6 @@ class FlashInferMultiStepDraftBackend:
         indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
         global global_override_indptr_cpu
 
-        if not self._debug_logged and os.environ.get("SGLANG_DEBUG_DRAFT_PARAMS") == "1" and seq_lens_sum > num_seqs:
-            self._debug_logged = True
-            seq_lens_cpu = forward_batch.seq_lens.cpu()
-            print(f"\n[FLAT DRAFT] common_template (pid={os.getpid()})", flush=True)
-            print(f"  num_seqs={num_seqs}, topk={self.topk}, bs={bs}", flush=True)
-            print(f"  speculative_num_steps={self.speculative_num_steps}, page_size={self.page_size}", flush=True)
-            print(f"  seq_lens={seq_lens_cpu.tolist()}, seq_lens_sum={seq_lens_sum}", flush=True)
-            print(f"  positions={forward_batch.positions.cpu().tolist()}", flush=True)
-            for i in range(self.speculative_num_steps - 1):
-                kv_idx_slice = kv_indices_buffer[i][: seq_lens_sum * self.topk + bs * (i + 1)]
-                print(f"  step {i}: kv_indices shape={kv_idx_slice.shape}, "
-                      f"first20={kv_idx_slice[:20].cpu().tolist()}, "
-                      f"last10={kv_idx_slice[-10:].cpu().tolist()}", flush=True)
-                print(f"  step {i}: kv_indptr={indptr_cpu_whole[i].tolist()}", flush=True)
-
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
@@ -1731,12 +1699,8 @@ class FlashInferMultiStepDraftBackend:
             call_fn(i, forward_batch)
 
         global_override_indptr_cpu = None
-        nvtx_pop()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if os.environ.get("SGLANG_DEBUG_PLAN_TIMING") == "1":
-            import time as _t
-            _t0 = _t.perf_counter_ns()
         kv_indices = torch.empty(
             (
                 self.speculative_num_steps,
@@ -1757,22 +1721,16 @@ class FlashInferMultiStepDraftBackend:
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
-        if os.environ.get("SGLANG_DEBUG_PLAN_TIMING") == "1":
-            _t1 = _t.perf_counter_ns()
-            if not hasattr(self, "_plan_ns_total"):
-                self._plan_ns_total = 0
-                self._plan_count = 0
-            self._plan_ns_total += (_t1 - _t0)
-            self._plan_count += 1
-            if self._plan_count in (1, 2, 5, 10, 20, 50) or self._plan_count % 100 == 0:
-                steady_avg_us = (self._plan_ns_total - getattr(self, "_plan_ns_first", 0)) / max(1, self._plan_count - 1) / 1000
-                print(f"[FLAT plan] count={self._plan_count} avg_all={self._plan_ns_total/self._plan_count/1000:.1f}us steady_avg={steady_avg_us:.1f}us total={self._plan_ns_total/1e6:.1f}ms", flush=True)
-            if self._plan_count == 1:
-                self._plan_ns_first = (_t1 - _t0)
-
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # The Triton kernel `generate_draft_decode_kv_indices` writes
+        # `topk * (cum_seq_len + bs * iters)` int32 entries per step (one slot
+        # per topk branch per token). The non-CG path in `init_forward_metadata`
+        # already sizes its buffer with `* self.topk`; the CG path was missing
+        # that factor, causing out-of-bounds writes (and a downstream
+        # cudaErrorIllegalAddress when reading `self.kv_indptr`) once
+        # `bs * topk * seq_len` exceeded `max_bs * max_context_len`.
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.max_context_len),
+            (self.speculative_num_steps, max_bs * self.topk * self.max_context_len),
             dtype=torch.int32,
             device="cuda",
         )

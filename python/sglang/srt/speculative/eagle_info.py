@@ -801,9 +801,31 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             return
         if spec_info.hidden_states is None:
             return
-        self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
-        )
+        if self.hidden_states.shape[1:] == spec_info.hidden_states.shape[1:]:
+            self.hidden_states = torch.cat(
+                [self.hidden_states, spec_info.hidden_states], axis=0
+            )
+        else:
+            # STANDALONE may pair a draft and target with different hidden
+            # sizes. Several sites (e.g. eagle_info.py idle fallback uses target
+            # hsz, capture_for_decode writes draft hsz) leave the running and
+            # last batches at different trailing dims, so torch.cat would fail.
+            # The draft model in STANDALONE does not consume the value of
+            # hidden_states, only the row count propagates downstream, so we
+            # collapse to a zero placeholder at the smaller hsz which still
+            # fits the cuda-graph hidden_states buffer.
+            smaller_hsz = min(
+                self.hidden_states.shape[-1], spec_info.hidden_states.shape[-1]
+            )
+            total_rows = (
+                self.hidden_states.shape[0] + spec_info.hidden_states.shape[0]
+            )
+            self.hidden_states = torch.zeros(
+                total_rows,
+                smaller_hsz,
+                dtype=self.hidden_states.dtype,
+                device=self.hidden_states.device,
+            )
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
