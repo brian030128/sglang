@@ -132,6 +132,39 @@ class DraftBackendFactory:
                 self.draft_model_runner, self.topk, self.speculative_num_steps
             )
 
+        if os.environ.get("SGLANG_FI_CASCADE_DRAFT") == "1":
+            from sglang.srt.layers.attention.flashinfer_multilevel_cascade_backend import (
+                FIMultiLevelCascadeMultiStepDraftBackend,
+            )
+            print(f"[DraftBackendFactory] Creating FIMultiLevelCascadeMultiStepDraftBackend (pid={os.getpid()})", flush=True)
+            return FIMultiLevelCascadeMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
+        if os.environ.get("SGLANG_HYDRAGEN_DRAFT_NO_CG") == "1":
+            raise ValueError(
+                "SGLANG_HYDRAGEN_DRAFT_NO_CG is gone: the Hydragen backend never "
+                "uses CUDA graphs, use SGLANG_HYDRAGEN_DRAFT=1"
+            )
+
+        if os.environ.get("SGLANG_HYDRAGEN_DRAFT") == "1":
+            from sglang.srt.layers.attention.hydragen_backend import (
+                HydragenMultiStepDraftBackend,
+            )
+            print(f"[DraftBackendFactory] Creating HydragenMultiStepDraftBackend (pid={os.getpid()})", flush=True)
+            return HydragenMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
+        if os.environ.get("SGLANG_DEFT_DRAFT") == "1":
+            from sglang.srt.layers.attention.deft_backend import (
+                DeFTMultiStepDraftBackend,
+            )
+            print(f"[DraftBackendFactory] Creating DeFTMultiStepDraftBackend (pid={os.getpid()})", flush=True)
+            return DeFTMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            )
+
         cascade_no_cg_val = os.environ.get("SGLANG_CASCADE_DRAFT_NO_CG")
         if cascade_no_cg_val == "1":
             from sglang.srt.layers.attention.flashinfer_cascade_backend import (
