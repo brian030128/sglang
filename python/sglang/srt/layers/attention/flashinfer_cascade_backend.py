@@ -16,6 +16,13 @@ CUDA-graph path: three-phase planning:
     in each wrapper's workspace buffer (~0.1ms vs ~3.5ms per iteration).
   - Replay (fallback): re-run full plan if chunk count changes (~every
     kv_limit/accept_rate iterations; rare).
+
+Suffix packing (SGLANG_CASCADE_PACK_SUFFIX, default on): the unique-suffix
+level runs G = 16 // GQA branches per 16-row MMA tile with a branch-diagonal
+mask instead of padding each branch's GQA rows to 16 (see
+CascadeBatchAttentionWrapper(pack_suffix=True)). Suffix indices are padded to
+whole groups of G branches; per-step kv_end patches go through
+wrapper.packed_step_kv().
 """
 
 from __future__ import annotations
@@ -157,7 +164,36 @@ class CascadeMultiStepDraftBackend:
                 CascadeDraftAttnBackend(model_runner, self._shared_wrapper, step_index=i)
             )
 
+        self._init_suffix_packing()
         self._modules_initialized = False
+
+    def _init_suffix_packing(self):
+        """Branches per packed suffix tile (G), or 1 when packing is off."""
+        self.pack_suffix = os.environ.get("SGLANG_CASCADE_PACK_SUFFIX", "1") == "1"
+        b = self.attn_backends[0]
+        gqa = b.num_qo_heads // b.num_kv_heads
+        g = 16 // gqa if 0 < gqa < 16 and 16 % gqa == 0 else 1
+        self.pack_group = g if self.pack_suffix else 1
+        if self.pack_group < 2:
+            self.pack_suffix = False
+        print(f"[{type(self).__name__}] suffix packing: "
+              f"{f'{self.pack_group} branches per tile' if self.pack_suffix else 'off'} "
+              f"(GQA {gqa}, pid={os.getpid()})", flush=True)
+
+    def _pad_unique_indices(self, kv_indices_unique, total_branches, depth):
+        """Pad suffix indices so the last packed group reads valid page ids
+        (repeating one; the padded columns are masked off by the kernel).
+        Matches CascadeBatchAttentionWrapper._pack_last_level."""
+        g = self.pack_group
+        n = (total_branches + g - 1) * depth
+        pad = n - kv_indices_unique.shape[0]
+        if g < 2 or pad <= 0:
+            return kv_indices_unique
+        return torch.cat([kv_indices_unique, kv_indices_unique[:1].expand(pad)])
+
+    def _cuda_graph_unique_pages(self, max_branches):
+        # + room for padding the last partial group of each plan (<= 16 branches)
+        return (max_branches + 16) * self.speculative_num_steps
 
     def _build_cascade_indices_and_plan(
         self,
@@ -374,12 +410,13 @@ class CascadeMultiStepDraftBackend:
             sm_scale=None,
             q_data_type=backend.q_data_type,
             kv_data_type=backend.data_type,
+            pack_suffix=self.pack_suffix,
         )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         max_branches = max_bs * self.topk
         max_shared_pages = max_bs * self.max_context_len
-        max_unique_pages = max_branches * self.speculative_num_steps
+        max_unique_pages = self._cuda_graph_unique_pages(max_branches)
         max_total_pages = max_shared_pages + max_unique_pages
 
         self.cuda_graph_kv_indices_buf = torch.zeros(
@@ -498,6 +535,9 @@ class CascadeMultiStepDraftBackend:
             self.device,
             self.pool_len,
         )
+        kv_indices_unique = self._pad_unique_indices(
+            kv_indices_unique, total_branches, max_depth
+        )
 
         # --- Plan ONCE on last wrapper ---
         last_idx = len(self.attn_backends) - 1
@@ -514,6 +554,7 @@ class CascadeMultiStepDraftBackend:
             sm_scale=None,
             q_data_type=last_backend.q_data_type,
             kv_data_type=last_backend.data_type,
+            pack_suffix=self.pack_suffix,
         )
 
         if use_fast_plan:
@@ -582,10 +623,14 @@ class CascadeMultiStepDraftBackend:
                     wrapper.module = last_wrapper.module
 
             # Patch Level 2 kv_len/kv_end for this step's suffix length
+            # (packed work items span several branches; see packed_step_kv)
             step_offset = i + 1
+            step_kv_len, step_kv_end = last_wrapper.packed_step_kv(
+                step_offset + 1, step_offset
+            )
             buf = wrapper.int_workspace_buffer.view(torch.int32)
-            buf[l1_kv_len_start + level2_indices] = step_offset + 1
-            buf[l1_kv_end_start + level2_indices] = step_offset
+            buf[l1_kv_len_start + level2_indices] = step_kv_len
+            buf[l1_kv_end_start + level2_indices] = step_kv_end
 
         self._modules_initialized = True
 
@@ -803,6 +848,9 @@ class CascadeMultiStepDraftBackend:
             self.device,
             self.pool_len,
         )
+        kv_indices_unique = self._pad_unique_indices(
+            kv_indices_unique, num_seqs * self.topk, max_depth
+        )
 
         # --- Copy indices to shared kv_indices buffer ---
         new_shared_len = kv_indices_shared.shape[0]
@@ -885,6 +933,7 @@ class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
                 CascadeDraftAttnBackend(model_runner, wrapper, step_index=None)
             )
 
+        self._init_suffix_packing()
         self._modules_initialized = False
 
     def _per_step_call_fn(self, i, *, qo_indptr_shared_cpu, qo_indptr_unique_cpu,
@@ -903,6 +952,7 @@ class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
             sm_scale=None,
             q_data_type=backend.q_data_type,
             kv_data_type=backend.data_type,
+            pack_suffix=self.pack_suffix,
         )
         # Default off: every step runs the full plan() (with sync). Set to "1" to
         # use fast_cascade_plan() after the first call (skips JIT lookup + sync).
@@ -932,7 +982,7 @@ class CascadePerStepMultiStepDraftBackend(CascadeMultiStepDraftBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         max_branches = max_bs * self.topk
         max_shared_pages = max_bs * self.max_context_len
-        max_unique_pages = max_branches * self.speculative_num_steps
+        max_unique_pages = self._cuda_graph_unique_pages(max_branches)
         max_total_pages = max_shared_pages + max_unique_pages
 
         # Per-step variant: every wrapper plans independently and writes its
